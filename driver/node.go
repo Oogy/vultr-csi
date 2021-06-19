@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"path/filepath"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
@@ -48,6 +49,11 @@ func (n *VultrNodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStag
 	volumeID, ok := req.GetPublishContext()[n.Driver.mountID]
 	if !ok {
 		return nil, status.Error(codes.InvalidArgument, "Could not find the volume id")
+	}
+
+	switch req.VolumeCapability.GetAccessType().(type) {
+	case *csi.VolumeCapability_Block:
+		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
 	source := getDeviceByPath(volumeID)
@@ -134,6 +140,10 @@ func (n *VultrNodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePu
 		return nil, status.Error(codes.InvalidArgument, "Target Path must be provided")
 	}
 
+	if req.VolumeCapability == nil {
+		return nil, status.Error(codes.InvalidArgument, "VolumeCapability must be provided")
+	}
+
 	log := n.Driver.log.WithFields(logrus.Fields{
 		"volume_id":           req.VolumeId,
 		"staging_target_path": req.StagingTargetPath,
@@ -146,26 +156,18 @@ func (n *VultrNodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePu
 		options = append(options, "ro")
 	}
 
-	mnt := req.VolumeCapability.GetMount()
-	for _, flag := range mnt.MountFlags {
-		options = append(options, flag)
+	var err error
+	switch req.GetVolumeCapability().GetAccessType().(type){
+		case *csi.VolumeCapability_Block:
+		err = n.NodePublishVolumeForBlock(ctx, req, options, log)
+		case *csi.VolumeCapability_Mount:
+		err = n.NodePublishVolumeForFilesystem(ctx, req, options, log)
+		default:
+		return nil, status.Error(codes.InvalidArgument, "Invalid volume capability")
 	}
 
-	fsType := "ext4"
-	if mnt.FsType != "" {
-		fsType = mnt.FsType
-	}
-
-	mounted, err := n.Driver.mounter.IsMounted(req.TargetPath)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "cannot verify mount status for %v, %v", req.StagingTargetPath, err.Error())
-	}
-
-	if !mounted {
-		err := n.Driver.mounter.Mount(req.StagingTargetPath, req.TargetPath, fsType, options...)
-		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
-		}
+		return nil, err
 	}
 
 	n.Driver.log.Info("Node Publish Volume: published")
@@ -243,6 +245,84 @@ func (n *VultrNodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoR
 	}, nil
 }
 
+func (n *VultrNodeServer) NodePublishVolumeForBlock(ctx context.Context, req *csi.NodePublishVolumeRequest, mountOpts []string, log *logrus.Entry) error {
+	volumeID, ok := req.GetPublishContext()[n.Driver.mountID]
+	if !ok {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("Could not find the volume name from the publish context %q", n.Driver.mountID))
+	}
+
+	source, err := findAbsoluteDeviceByPath(volumeID) // I think this might be what is wrong. At the very least, good place to start
+	if err != nil {
+		return status.Errorf(codes.Internal, "Could not get device path for volume %s. %v", req.VolumeId, err)
+	}
+
+	mounted, err := n.Driver.mounter.IsMounted(req.TargetPath)
+	if err != nil {
+		return err
+	}
+
+	if !mounted {
+		log.Info("mounting volume")
+		if err := n.Driver.mounter.Mount(source, req.TargetPath, "", mountOpts...); err != nil {
+			return status.Errorf(codes.Internal, err.Error())
+		}
+	} else {
+		log.Info("volume is already mounted")
+	}
+
+	n.Driver.log.WithFields(logrus.Fields{
+		"source": source,
+		"volume_mode": "block",
+		"mount_options": mountOpts,
+	}).Info("Node Publish Volume For Block: called")
+
+	return nil
+}
+
+func (n *VultrNodeServer) NodePublishVolumeForFilesystem(ctx context.Context, req *csi.NodePublishVolumeRequest, mountOpts []string, log *logrus.Entry) error {
+	mnt := req.VolumeCapability.GetMount()
+	for _, flag := range mnt.MountFlags {
+		mountOpts = append(mountOpts, flag)
+	}
+
+	fsType := "ext4"
+	if mnt.FsType != "" {
+		fsType = mnt.FsType
+	}
+
+	mounted, err := n.Driver.mounter.IsMounted(req.TargetPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "cannot verify mount status for %v, %v", req.StagingTargetPath, err.Error())
+	}
+
+	if !mounted {
+		err := n.Driver.mounter.Mount(req.StagingTargetPath, req.TargetPath, fsType, mountOpts...)
+		if err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	return nil
+}
+
 func getDeviceByPath(volumeID string) string {
 	return filepath.Join(diskPath, fmt.Sprintf("%s%s", diskPrefix, volumeID))
+}
+
+// findAbsoluteDeviceByIDPath follows the /dev/disk/by-id symlink to find the absolute path of a device
+func findAbsoluteDeviceByPath(volumeName string) (string, error) {
+	path := getDeviceByPath(volumeName)
+
+	// EvalSymlinks returns relative link if the file is not a symlink
+	// so we do not have to check if it is symlink prior to evaluation
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("could not resolve symlink %q: %v", path, err)
+	}
+
+	if !strings.HasPrefix(resolved, "/dev") {
+		return "", fmt.Errorf("resolved symlink %q for %q was unexpected", resolved, path)
+	}
+
+	return resolved, nil
 }

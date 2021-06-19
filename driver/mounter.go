@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"path/filepath"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 type Mounter interface {
@@ -16,6 +18,7 @@ type Mounter interface {
 	Mount(source, target, fs string, opts ...string) error
 	IsMounted(target string) (bool, error)
 	UnMount(target string) error
+	IsBlockDevice(volumePath string) (bool, error)
 }
 
 type mounter struct {
@@ -103,32 +106,34 @@ func (m *mounter) IsFormatted(source string) (bool, error) {
 
 func (m *mounter) Mount(source, target, fs string, opts ...string) error {
 	if source == "" {
-		return errors.New("source type was not provided - required for mounting")
+		return errors.New("no source provided - required for mounting")
 	}
 
 	if target == "" {
-		return errors.New("target type was not provided - required for mounting")
+		return errors.New("no target provided - required for mounting")
 	}
-
-	if fs == "" {
-		return errors.New("fs type was not provided - required for mounting")
-	}
-
-	m.log.WithFields(logrus.Fields{
-		"source":     source,
-		"target":     target,
-		"filesystem": fs,
-		"options":    opts,
-		"methods":    "mount",
-	}).Info("Mount Called")
 
 	mountCommand := "mount"
 	mountArguments := []string{}
 
-	mountArguments = append(mountArguments, "-t", fs)
-	err := os.MkdirAll(target, 0750)
-	if err != nil {
-		return err
+	if fs == "" {
+		err := os.MkdirAll(filepath.Dir(target), 0750)
+		if err != nil {
+			return fmt.Errorf("could not create target directory for raw block bind mount: %v", err)
+		}
+
+		file, _ := os.OpenFile(target, os.O_CREATE, 0660)
+		if err != nil {
+			return fmt.Errorf("could not create target file for raw block bind mount: %v", err)
+		}
+		file.Close()
+	} else {
+		mountArguments = append(mountArguments, "-t", fs)
+
+		err := os.MkdirAll(target, 0750)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(opts) > 0 {
@@ -149,12 +154,14 @@ func (m *mounter) Mount(source, target, fs string, opts ...string) error {
 			err, mountCommand, strings.Join(mountArguments, " "), string(out))
 	}
 
-	if _, err := os.Stat(target + "/lost+found"); err == nil {
-		os.Remove(target + "/lost+found")
-	} else if os.IsNotExist(err) {
-		m.log.WithFields(logrus.Fields{
-			"error": err,
-		}).Info("mount command - removal of lost+found error")
+	if fs != "" {
+		if _, err := os.Stat(target + "/lost+found"); err == nil {
+			os.Remove(target + "/lost+found")
+		} else if os.IsNotExist(err) {
+			m.log.WithFields(logrus.Fields{
+				"error": err,
+			}).Info("mount command - removal of lost+found error")
+		}
 	}
 
 	return nil
@@ -216,4 +223,14 @@ func (m *mounter) UnMount(target string) error {
 	}
 
 	return nil
+}
+
+func (m *mounter) IsBlockDevice(devicePath string) (bool, error) {
+	var stat unix.Stat_t
+	err := unix.Stat(devicePath, &stat)
+	if err != nil {
+		return false, err
+	}
+
+	return (stat.Mode & unix.S_IFMT) == unix.S_IFBLK, nil
 }
